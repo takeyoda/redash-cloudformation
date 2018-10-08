@@ -1,0 +1,468 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: Networking
+        Parameters:
+          - VPC
+          - RDSSubnets
+          - RedisSubnets
+          - ECSSubnets
+          - ALBSubnets
+          - AccessAllowFromCIDR
+      -
+        Label:
+          default: Database
+        Parameters:
+          - RDSDatabase
+          - RDSUsername
+          - RDSPassword
+      -
+        Label:
+          default: Mail
+        Parameters:
+          - SMTPHost
+          - SMTPPort
+          - SMTPUseTLS
+          - SMTPUsername
+          - SMTPPassword
+          - SMTPSender
+      -
+        Label:
+          default: Security
+        Parameters:
+          - CookieSecret
+      -
+        Label:
+          default: Performance
+        Parameters:
+          - DesiredCount
+
+Parameters:
+  VPC:
+    Type: AWS::EC2::VPC::Id
+  RDSSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+  RedisSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+  ECSSubnets: # requires NAT
+    Type: List<AWS::EC2::Subnet::Id>
+  ALBSubnets: # internet facing
+    Type: List<AWS::EC2::Subnet::Id>
+  AccessAllowFromCIDR:
+    Type: String
+    Default: 127.0.0.1/32
+    Description: CHANGE ME
+
+  RDSDatabase:
+    Type: String
+    AllowedPattern: '[A-Za-z0-9-]+'
+  RDSUsername:
+    Type: String
+  RDSPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+
+  CookieSecret:
+    Type: String
+    MinLength: 32
+    MaxLength: 32
+
+  DesiredCount:
+    Type: Number
+    Default: 1
+
+  SMTPHost:
+    Type: String
+    Default: email-smtp.us-east-1.amazonaws.com
+  SMTPPort:
+    Type: Number
+    Default: 587
+  SMTPUseTLS:
+    Type: String
+    AllowedValues: [ 'true', 'false' ]
+  SMTPUsername:
+    Type: String
+  SMTPPassword:
+    Type: String
+    NoEcho: true
+  SMTPSender:
+    Type: String
+
+Conditions:
+  HasSMTPUsername: !Not [ !Equals [ !Ref 'SMTPUsername', '' ] ]
+  HasSMTPPassword: !Not [ !Equals [ !Ref 'SMTPPassword', '' ] ]
+
+Resources:
+  ####################################
+  # ALB
+  ####################################
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      LoadBalancerAttributes:
+      - Key: idle_timeout.timeout_seconds
+        Value: 30
+      Subnets: !Ref ALBSubnets
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Type: application
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties: 
+      # Certificates:
+      #   - Certificate
+      DefaultActions:
+        - TargetGroupArn: !Ref ALBTargetGroup
+          Type: 'forward'
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      # SslPolicy: String
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Matcher:
+        HttpCode: 302
+      TargetType: ip
+      Port: 5000
+      Protocol: HTTP
+      UnhealthyThresholdCount: 2
+      VpcId: !Ref VPC
+
+  ALBLoadBalancerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - TargetGroupArn: !Ref ALBTargetGroup
+          Type: forward
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - '*'
+      ListenerArn: !Ref ALBListener
+      Priority: 10
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Redash ALB security group'
+      SecurityGroupIngress:
+        - CidrIp: !Ref AccessAllowFromCIDR
+          Description: 'from www'
+          FromPort: 80
+          ToPort: 80
+          IpProtocol: tcp
+      VpcId: !Ref VPC
+
+  ####################################
+  # ECS
+  ####################################
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+
+  ECSExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+       Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ ecs-tasks.amazonaws.com ]
+          Action: [ 'sts:AssumeRole' ]
+      Path: /
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+
+  ECSServiceRole:
+    Type: "AWS::IAM::ServiceLinkedRole"
+    Properties:
+      AWSServiceName: "ecs.amazonaws.com"
+      Description: "Role to enable Amazon ECS to manage your cluster."
+
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Cpu: 512
+      ExecutionRoleArn: !GetAtt ECSExecutionRole.Arn
+      Family: redash
+      Memory: 4GB
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ContainerDefinitions:
+        - 
+          Command:
+            - server
+          DisableNetworking: false
+          EntryPoint:
+            - /app/bin/docker-entrypoint
+          Environment:
+            - Name: REDASH_DATE_FORMAT
+              Value: YYYY-MM-DD
+            - Name: REDASH_REDIS_URL
+              Value: !Sub 'redis://${Redis.RedisEndpoint.Address}:${Redis.RedisEndpoint.Port}/0'
+            - Name: REDASH_WEB_WORKERS
+              Value: 1
+            - Name: PYTHONUNBUFFERED
+              Value: 0
+            - Name: REDASH_DATABASE_URL
+              Value: !Sub 'postgresql://${RDSUsername}:${RDSPassword}@${RDS.Endpoint.Address}:${RDS.Endpoint.Port}/${RDSDatabase}'
+            - Name: REDASH_MAIL_SERVER
+              Value: !Ref SMTPHost
+            - Name: REDASH_MAIL_PORT
+              Value: !Ref SMTPPort
+            - Name: REDASH_MAIL_USE_TLS
+              Value: !Ref SMTPUseTLS
+            - Name: REDASH_MAIL_USERNAME
+              Value:
+                Fn::If: [ HasSMTPUsername, !Ref SMTPUsername, !Ref 'AWS::NoValue' ]
+            - Name: REDASH_MAIL_PASSWORD
+              Value:
+                Fn::If: [ HasSMTPPassword, !Ref SMTPPassword, !Ref 'AWS::NoValue' ]
+            - Name: REDASH_MAIL_DEFAULT_SENDER
+              Value: !Ref SMTPSender
+            - Name: REDASH_COOKIE_SECRET
+              Value: !Ref CookieSecret
+          Essential: true
+          Image: redash/redash:latest
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Sub ${AWS::Region}
+              awslogs-group: !Ref ECSLogForServer
+              awslogs-stream-prefix: ecs
+          Memory: 2048
+          Name: redash-server
+          PortMappings:
+            - 
+              ContainerPort: 5000
+              HostPort: 5000
+              Protocol: tcp
+          ReadonlyRootFilesystem: false # tmp ディレクトリを使うっぽい IOError: [Errno 2] No usable temporary directory found in ['/tmp', '/var/tmp', '/usr/tmp', '/app']
+          WorkingDirectory: /app
+        - 
+          Command:
+            - scheduler
+          DisableNetworking: false
+          EntryPoint:
+            - /app/bin/docker-entrypoint
+          Environment:
+            - Name: REDASH_DATE_FORMAT
+              Value: YYYY-MM-DD
+            - Name: REDASH_REDIS_URL
+              Value: !Sub 'redis://${Redis.RedisEndpoint.Address}:${Redis.RedisEndpoint.Port}/0'
+            - Name: WORKERS_COUNT
+              Value: 1
+            - Name: PYTHONUNBUFFERED
+              Value: 0
+            - Name: QUEUES
+              Value: 'queries,scheduled_queries,celery'
+            - Name: REDASH_DATABASE_URL
+              Value: !Sub 'postgresql://${RDSUsername}:${RDSPassword}@${RDS.Endpoint.Address}:${RDS.Endpoint.Port}/${RDSDatabase}'
+            - Name: REDASH_MAIL_SERVER
+              Value: !Ref SMTPHost
+            - Name: REDASH_MAIL_PORT
+              Value: !Ref SMTPPort
+            - Name: REDASH_MAIL_USE_TLS
+              Value: !Ref SMTPUseTLS
+            - Name: REDASH_MAIL_USERNAME
+              Value:
+                Fn::If: [ HasSMTPUsername, !Ref SMTPUsername, !Ref 'AWS::NoValue' ]
+            - Name: REDASH_MAIL_PASSWORD
+              Value:
+                Fn::If: [ HasSMTPPassword, !Ref SMTPPassword, !Ref 'AWS::NoValue' ]
+            - Name: REDASH_MAIL_DEFAULT_SENDER
+              Value: !Ref SMTPSender
+          Essential: true
+          Image: redash/redash:latest
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Sub ${AWS::Region}
+              awslogs-group: !Ref ECSLogForScheduler
+              awslogs-stream-prefix: ecs
+          Memory: 2048
+          Name: redash-scheduler
+          ReadonlyRootFilesystem: false
+          WorkingDirectory: /app
+
+  ECSInitTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Cpu: 512
+      ExecutionRoleArn: !GetAtt ECSExecutionRole.Arn
+      Family: redash-init
+      Memory: 2GB
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ContainerDefinitions:
+        - 
+          Command:
+            - ./manage.py
+            - database
+            - create_tables
+          DisableNetworking: false
+          EntryPoint:
+            - /app/bin/run
+          Environment:
+            - Name: REDASH_DATE_FORMAT
+              Value: YYYY-MM-DD
+            - Name: REDASH_REDIS_URL
+              Value: !Sub 'redis://${Redis.RedisEndpoint.Address}:${Redis.RedisEndpoint.Port}/0'
+            - Name: PYTHONUNBUFFERED
+              Value: 0
+            - Name: REDASH_DATABASE_URL
+              Value: !Sub 'postgresql://${RDSUsername}:${RDSPassword}@${RDS.Endpoint.Address}:${RDS.Endpoint.Port}/${RDSDatabase}'
+          Essential: true
+          Image: redash/redash:latest
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Sub ${AWS::Region}
+              awslogs-group: !Ref ECSLogForInit
+              awslogs-stream-prefix: ecs
+          Memory: 2048
+          Name: redash-init
+          ReadonlyRootFilesystem: false
+          WorkingDirectory: /app
+
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBLoadBalancerRule
+    Properties: 
+      Cluster: !Ref ECSCluster
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      DesiredCount: !Ref DesiredCount
+      HealthCheckGracePeriodSeconds: 30
+      LaunchType: FARGATE
+      LoadBalancers:
+        - ContainerName: 'redash-server'
+          ContainerPort: 5000
+          TargetGroupArn: !Ref ALBTargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups: 
+            - !GetAtt ECSSecurityGroup.GroupId
+          Subnets: !Ref ECSSubnets
+      ServiceName: redash
+      TaskDefinition: !Ref ECSTaskDefinition
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Redash ECS security group'
+      SecurityGroupIngress:
+        - SourceSecurityGroupId: !GetAtt ALBSecurityGroup.GroupId
+          Description: 'from ALB'
+          FromPort: 5000
+          ToPort: 5000
+          IpProtocol: tcp
+      VpcId: !Ref VPC
+
+  ECSLogForServer:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      RetentionInDays: 1
+
+  ECSLogForScheduler:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      RetentionInDays: 1
+
+  ECSLogForInit:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 1
+
+  ####################################
+  # RDS
+  ####################################
+  RDS:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      AllocatedStorage: 20
+      AllowMajorVersionUpgrade: false
+      AutoMinorVersionUpgrade: true
+      BackupRetentionPeriod: 0
+      DBInstanceClass: db.t2.small
+      DBName: !Ref RDSDatabase
+      DBSubnetGroupName: !Ref RDSSubnetGroup
+      Engine: postgres
+      EngineVersion: 9.6.9
+      MasterUsername: !Ref RDSUsername
+      MasterUserPassword: !Ref RDSPassword
+      MultiAZ: false
+      Port: 5432
+      PreferredMaintenanceWindow: sun:15:00-sun:16:00
+      PubliclyAccessible: false
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+
+  RDSSubnetGroup:
+    Type: "AWS::RDS::DBSubnetGroup"
+    Properties:
+      DBSubnetGroupDescription: 'RDS for redash subnet group'
+      SubnetIds: !Ref RDSSubnets
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Redash RDS security group'
+      SecurityGroupIngress:
+        - SourceSecurityGroupId: !GetAtt ECSSecurityGroup.GroupId
+          Description: 'from ECS'
+          FromPort: 5432
+          ToPort: 5432
+          IpProtocol: tcp
+      VpcId: !Ref VPC
+
+  ####################################
+  # Redis
+  ####################################
+  Redis:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      AutoMinorVersionUpgrade: true
+      AZMode: single-az
+      CacheNodeType: cache.t2.micro
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      Engine: redis
+      NumCacheNodes: 1
+      PreferredMaintenanceWindow: sun:15:00-sun:16:00
+      VpcSecurityGroupIds:
+        - !Ref RedisSecurityGroup
+ 
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: 'Redis for redash subnet group'
+      SubnetIds: !Ref RedisSubnets
+
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Redash Redis security group'
+      SecurityGroupIngress:
+        - SourceSecurityGroupId: !GetAtt ECSSecurityGroup.GroupId
+          Description: 'from ECS'
+          FromPort: 6379
+          ToPort: 6379
+          IpProtocol: tcp
+      VpcId: !Ref VPC
